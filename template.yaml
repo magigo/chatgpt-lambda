@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: A simple serverless application for handling WeChat Work callback messages.
+
+Parameters:
+  AppToken:
+    Type: String
+    Description: Your WeChat Work app token.
+  EncodingAESKey:
+    Type: String
+    Description: Your WeChat Work encoding AES key.
+  CorpID:
+    Type: String
+    Description: Your WeChat Work CorpID.
+  CorpSecret:
+    Type: String
+    Description: Your WeChat Corp Secret.
+  OpenAIOrg:
+    Type: String
+    Description: Your OpenAI organization.
+  OpenAIApiKey:
+    Type: String
+    Description: Your OpenAI ApiKey.
+  HostedZoneId:
+    Type: String
+    Description: Route 53 Hosted Zone ID
+  CertificateArn:
+    Type: String
+    Description: ACM 证书 ARN
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC ID for the EC2 instance and security group
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: The Subnet ID for the EC2 instance
+  KeyPairName:
+    Type: String
+    Description: Name of the EC2 key pair
+  LatestAmazonLinux2AMI:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+Resources:
+  WeChatWorkCallbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: WeChatWorkCallbackFunction
+      Handler: wechat_work/wechat_work_callback.lambda_handler
+      Runtime: python3.9
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSLambdaVPCAccessExecutionRole
+        - AmazonSQSFullAccess
+      Architectures:
+        - arm64
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          APP_TOKEN: !Ref AppToken
+          ENCODING_AES_KEY: !Ref EncodingAESKey
+          CORP_ID: !Ref CorpID
+          CORP_SECRET: !Ref CorpSecret
+          OPEN_AI_ORG: !Ref OpenAIOrg
+          OPEN_AI_API_KEY: !Ref OpenAIApiKey
+          PROXY_IP: !Ref EIP
+          QUEUE_URL: !Ref YourSQSQueue
+      Events:
+        HttpGetEvent:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: WeChatCallbackApi
+            Path: /chatgpt/callback
+            Method: GET
+        HttpPostEvent:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: WeChatCallbackApi
+            Path: /chatgpt/callback
+            Method: POST
+  WeChatCallbackApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Domain:
+        DomainName: gpt-api.mrotob.com
+        CertificateArn: !Ref CertificateArn
+        EndpointConfiguration: REGIONAL
+        Route53:
+          HostedZoneId: !Ref HostedZoneId
+  ProcessFromSQSFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: call_open_ai/process_from_sqs.lambda_handler
+      Runtime: python3.9
+      Architectures:
+        - arm64
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSLambdaVPCAccessExecutionRole
+        - AmazonSQSFullAccess
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UserSessionsTable
+      Timeout: 60
+      Environment:
+        Variables:
+          CORP_ID: !Ref CorpID
+          CORP_SECRET: !Ref CorpSecret
+          OPEN_AI_ORG: !Ref OpenAIOrg
+          OPEN_AI_API_KEY: !Ref OpenAIApiKey
+          PROXY_IP: !Ref EIP
+          TABLE_NAME: !Ref UserSessionsTable
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt YourSQSQueue.Arn
+  YourSQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 62
+      MessageRetentionPeriod: 3600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MyQueueDLQ.Arn
+        maxReceiveCount: 2
+  MyQueueDLQ:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: my-queue-dlq
+      MessageRetentionPeriod: 86400
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.nano
+      ImageId: !Ref LatestAmazonLinux2AMI
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref SubnetId
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Update package manager
+          yum update -y
+          
+          # Install Squid
+          yum install -y squid
+          
+          # Configure Squid
+          cat > /etc/squid/squid.conf << EOL
+          acl localnet src 0.0.0.1-0.255.255.255
+          acl localnet src 10.0.0.0/8
+          acl localnet src 100.64.0.0/10
+          acl localnet src 169.254.0.0/16
+          acl localnet src 172.16.0.0/12
+          acl localnet src 192.168.0.0/16
+          acl localnet src fc00::/7
+          acl localnet src fe80::/10
+          acl all src 0.0.0.0/0
+          acl SSL_ports port 443
+          acl Safe_ports port 80
+          acl Safe_ports port 21
+          acl Safe_ports port 443
+          acl Safe_ports port 70
+          acl Safe_ports port 210
+          acl Safe_ports port 1025-65535
+          acl Safe_ports port 280
+          acl Safe_ports port 488
+          acl Safe_ports port 591
+          acl Safe_ports port 777
+          acl CONNECT method CONNECT
+          http_access deny !Safe_ports
+          http_access deny CONNECT !SSL_ports
+          http_access allow localhost manager
+          http_access deny manager
+          http_access allow all
+          http_port 3628
+          coredump_dir /var/spool/squid
+          refresh_pattern ^ftp:           1440    20%     10080
+          refresh_pattern ^gopher:        1440    0%      1440
+          refresh_pattern -i (/cgi-bin/|\?) 0     0%      0
+          refresh_pattern .               0       20%     4320
+          EOL
+          
+          # Enable and start Squid
+          systemctl enable squid
+          systemctl start squid
+
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3628
+          ToPort: 3628
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  EIP:
+    Type: AWS::EC2::EIP
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref EC2Instance
+      EIP: !Ref EIP
+
+  UserSessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: UserSessions
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+
+Outputs:
+  InstanceId:
+    Description: Instance ID
+    Value: !Ref EC2Instance
+
+  EIP:
+    Description: Elastic IP
+    Value: !Ref EIP
